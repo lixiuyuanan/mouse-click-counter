@@ -20,9 +20,38 @@ from tkinter import messagebox, ttk
 APP_TITLE = "鼠标点击次数记录"
 BYLINE = "by 黎修源"
 FROZEN = getattr(sys, "frozen", False)  # 是否由 PyInstaller 打包成 exe 运行
-APP_DIR = os.path.dirname(sys.executable) if FROZEN else os.path.dirname(os.path.abspath(__file__))
+EXE_DIR = os.path.dirname(sys.executable) if FROZEN else os.path.dirname(os.path.abspath(__file__))
 DATA_NAME = "点击数据记录（勿删！！！）.json"
 LEGACY_DATA_NAMES = ("data.json",)  # 旧版本文件名，存在时自动兼容读取
+
+
+def _dir_writable(path):
+    probe = os.path.join(path, ".write_probe.tmp")
+    try:
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("x")
+        os.remove(probe)
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_data_dir(base):
+    """exe 同级目录可写就用它；不可写（Program Files、只读共享、写保护U盘）就退到
+    %LOCALAPPDATA%\\鼠标点击次数记录，避免出现"界面在走、数据其实没保存"。"""
+    if _dir_writable(base):
+        return base
+    fallback = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), APP_TITLE)
+    try:
+        os.makedirs(fallback, exist_ok=True)
+        if _dir_writable(fallback):
+            return fallback
+    except Exception:
+        pass
+    return base
+
+
+APP_DIR = _resolve_data_dir(EXE_DIR)  # 数据/日志目录（可写）
 DATA_FILE = os.path.join(APP_DIR, DATA_NAME)
 LOG_FILE = os.path.join(APP_DIR, "error.log")
 TRAY_LOG = os.path.join(APP_DIR, "tray.log")  # 托盘事件诊断日志（可删）
@@ -30,7 +59,8 @@ TRAY_LOG = os.path.join(APP_DIR, "tray.log")  # 托盘事件诊断日志（可�
 MUTEX_NAME = "MouseClickCounter_SingleInstance_v1"
 SHOW_EVENT_NAME = "MouseClickCounter_ShowWindow_v1"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-RUN_VALUE = "MouseClickCounter"
+RUN_VALUE = "鼠标点击次数记录"          # 任务管理器「启动应用」里显示的就是这个名字
+RUN_VALUE_LEGACY = "MouseClickCounter"  # 旧版本用过，设置/取消时一并清理
 
 BUTTONS = (
     ("left", "左键"),
@@ -159,6 +189,7 @@ class Stats:
         self.path = path
         self.days = {}
         self.total = {k: 0 for k in KEYS}
+        self.settings = {}
         self.dirty = False
         self._load()
 
@@ -166,10 +197,13 @@ class Stats:
         path = self.path
         if not os.path.exists(path):
             for legacy in LEGACY_DATA_NAMES:
-                candidate = os.path.join(APP_DIR, legacy)
-                if os.path.exists(candidate):
-                    path = candidate
-                    log("从旧文件名 %s 读取数据，下次保存会自动写成 %s" % (legacy, DATA_NAME))
+                for folder in (APP_DIR, EXE_DIR):
+                    candidate = os.path.join(folder, legacy)
+                    if os.path.exists(candidate):
+                        path = candidate
+                        log("从旧文件名 %s 读取数据，下次保存会自动写成 %s" % (legacy, DATA_NAME))
+                        break
+                if path != self.path:
                     break
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -188,6 +222,16 @@ class Stats:
             self.days[day] = row
             for k in KEYS:
                 self.total[k] += row[k]
+        if isinstance(raw.get("settings"), dict):
+            self.settings = dict(raw["settings"])
+
+    def get_setting(self, key, default=None):
+        return self.settings.get(key, default)
+
+    def set_setting(self, key, value):
+        if self.settings.get(key) != value:
+            self.settings[key] = value
+            self.dirty = True
 
     def add(self, key, date=None):
         day = (date or today()).isoformat()
@@ -205,6 +249,7 @@ class Stats:
             "app": APP_TITLE,
             "version": 1,
             "updated": datetime.datetime.now().isoformat(timespec="seconds"),
+            "settings": self.settings,
             "days": self.days,
         }
         tmp = self.path + ".tmp"
@@ -297,12 +342,12 @@ def shell32_api():
 
 def find_icon_file():
     """图标可以在 exe 同级，也可以放在任意一级子文件夹里（如 其他文件\\icon.ico）。"""
-    direct = os.path.join(APP_DIR, "icon.ico")
+    direct = os.path.join(EXE_DIR, "icon.ico")
     if os.path.exists(direct):
         return direct
     try:
-        for entry in sorted(os.listdir(APP_DIR)):
-            sub = os.path.join(APP_DIR, entry)
+        for entry in sorted(os.listdir(EXE_DIR)):
+            sub = os.path.join(EXE_DIR, entry)
             if os.path.isdir(sub):
                 candidate = os.path.join(sub, "icon.ico")
                 if os.path.exists(candidate):
@@ -551,36 +596,93 @@ def pythonw_path():
 
 
 def startup_command():
+    """自启动命令。带 --startup：开机时静默启动（只驻留托盘，不弹窗口）。"""
     if FROZEN:
-        return '"%s"' % sys.executable
-    return '"%s" "%s"' % (pythonw_path(), os.path.join(APP_DIR, "mouse_counter.py"))
+        return '"%s" --startup' % sys.executable
+    return '"%s" "%s" --startup' % (pythonw_path(), os.path.join(EXE_DIR, "mouse_counter.py"))
 
 
-def startup_enabled():
+def read_run_value():
     import winreg
 
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
             value, _ = winreg.QueryValueEx(key, RUN_VALUE)
-            return bool(value)
+            return value or None
     except FileNotFoundError:
-        return False
+        return None
     except Exception as exc:
         log("读取开机自启动状态失败: %r" % (exc,))
-        return False
+        return None
 
 
-def set_startup(enable):
+def write_run_value(value):
     import winreg
 
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
-        if enable:
-            winreg.SetValueEx(key, RUN_VALUE, 0, winreg.REG_SZ, startup_command())
-        else:
+        winreg.SetValueEx(key, RUN_VALUE, 0, winreg.REG_SZ, value)
+        for name in (RUN_VALUE_LEGACY,):
             try:
-                winreg.DeleteValue(key, RUN_VALUE)
+                winreg.DeleteValue(key, name)
             except FileNotFoundError:
                 pass
+
+
+def delete_run_values():
+    import winreg
+
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            for name in (RUN_VALUE, RUN_VALUE_LEGACY):
+                try:
+                    winreg.DeleteValue(key, name)
+                except FileNotFoundError:
+                    pass
+    except Exception as exc:
+        log("删除开机自启动失败: %r" % (exc,))
+
+
+def startup_enabled():
+    return bool(read_run_value())
+
+
+def set_startup(enable, stats=None):
+    """开关自启动，并把用户的选择记进数据文件（跟着文件夹走）。"""
+    if enable:
+        write_run_value(startup_command())
+    else:
+        delete_run_values()
+    if stats is not None:
+        try:
+            stats.set_setting("autostart", bool(enable))
+            stats.save()
+        except Exception as exc:
+            log("记录自启动偏好失败: %r" % (exc,))
+    return startup_enabled()
+
+
+def sync_autostart(stats):
+    """每次启动时对齐自启动状态（换电脑/挪文件夹后自动恢复）：
+      1) 注册表里已有项但路径不是当前 exe → 改写成当前路径；
+      2) 注册表里没有、但数据文件记着用户开过自启动 → 重新写入；
+      3) 都没有 → 不动（不擅自帮用户开自启动）。"""
+    target = startup_command()
+    current = read_run_value()
+    want = bool(stats.get_setting("autostart", False))
+    try:
+        if current:
+            if current != target:
+                write_run_value(target)
+                tray_log("自启动路径已更新为当前位置: %s" % target)
+            stats.set_setting("autostart", True)
+        elif want:
+            write_run_value(target)
+            tray_log("未找到自启动项，按上次设置重新写入: %s" % target)
+        else:
+            return False
+    except Exception as exc:
+        log("对齐自启动失败: %r" % (exc,))
+        return False
     return startup_enabled()
 
 
@@ -798,7 +900,7 @@ class App:
 
     def toggle_startup(self):
         try:
-            enabled = set_startup(self.autostart.get())
+            enabled = set_startup(self.autostart.get(), self.stats)
             self.autostart.set(enabled)
             self.status.configure(
                 text="开机自启动已开启" if enabled else "开机自启动已关闭", fg=self.MUTED)
@@ -807,7 +909,7 @@ class App:
             messagebox.showerror(APP_TITLE, "设置开机自启动失败：\n%r" % (exc,))
 
     def open_folder(self):
-        os.startfile(APP_DIR)
+        os.startfile(EXE_DIR if os.path.isdir(EXE_DIR) else APP_DIR)
 
     def on_close(self):
         choice = messagebox.askyesnocancel(
@@ -883,10 +985,10 @@ def main():
         dump()
         return
     if "--set-startup" in args:
-        print("开机自启动：%s" % ("已开启" if set_startup(True) else "设置失败"))
+        print("开机自启动：%s" % ("已开启" if set_startup(True, Stats(DATA_FILE)) else "设置失败"))
         return
     if "--clear-startup" in args:
-        print("开机自启动：%s" % ("已关闭" if not set_startup(False) else "关闭失败"))
+        print("开机自启动：%s" % ("已关闭" if not set_startup(False, Stats(DATA_FILE)) else "关闭失败"))
         return
 
     unique, handle = acquire_single_instance()
@@ -894,9 +996,15 @@ def main():
         return
     kernel32, event = handle
 
+    silent = "--startup" in args  # 由开机自启动拉起：只驻留托盘，不弹窗口
+    tray_log("程序启动 pid=%s frozen=%s silent=%s cwd=%s"
+             % (os.getpid(), FROZEN, silent, os.getcwd()))
     sink = queue.Queue()
     stats = Stats(DATA_FILE)
+    sync_autostart(stats)
     root = tk.Tk()
+    if silent:
+        root.withdraw()
     app = App(root, stats, sink)
     watch_show_event(kernel32, event, sink)
     start_worker(sink)
