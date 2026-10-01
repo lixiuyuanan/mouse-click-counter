@@ -1,0 +1,22 @@
+# 个人点击数据与运行时产物 —— 不要提交
+点击数据记录（勿删！！！）.json
+data.json
+error.log
+tray.log
+
+# 本地测试时新编译出来的 exe（仓库里那份发布版是有意保留的）
+dist/
+build/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器与系统
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
