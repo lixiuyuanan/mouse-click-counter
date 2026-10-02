@@ -11,8 +11,10 @@ import datetime
 import json
 import os
 import queue
+import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from ctypes import wintypes as wt
 from tkinter import messagebox, ttk
@@ -61,6 +63,8 @@ SHOW_EVENT_NAME = "MouseClickCounter_ShowWindow_v1"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "鼠标点击次数记录"          # 任务管理器「启动应用」里显示的就是这个名字
 RUN_VALUE_LEGACY = "MouseClickCounter"  # 旧版本用过，设置/取消时一并清理
+TASK_NAME = "鼠标点击次数记录"           # 计划任务名（最高权限开机自启）
+CREATE_NO_WINDOW = 0x08000000
 
 BUTTONS = (
     ("left", "左键"),
@@ -80,6 +84,7 @@ WM_XBUTTONDOWN = 0x020B
 ERROR_ALREADY_EXISTS = 183
 WM_APP = 0x8000
 WM_TRAY = WM_APP + 1
+WM_HOOK_REINSTALL = WM_APP + 2  # 界面线程 → 钩子线程：重装钩子
 WM_NULL = 0x0000
 WM_DESTROY = 0x0002
 WM_LBUTTONUP = 0x0202
@@ -145,6 +150,13 @@ class WNDCLASSW(ctypes.Structure):
 
 
 TRAY = {"hwnd": None, "ready": False}
+HOOK_STATE = {"installed": False, "last_event": 0.0, "thread_id": 0, "blocked_logged": False}
+SINGLETON = {"mutex": None, "kernel32": None}
+AUTOSTART = {"mode": ""}  # "task"=最高权限计划任务 / "run"=注册表 / ""=未开启
+
+
+class LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wt.UINT), ("dwTime", wt.DWORD)]
 
 
 class MSLLHOOKSTRUCT(ctypes.Structure):
@@ -318,8 +330,43 @@ def user32_api():
     u.IsWindow.argtypes = [ctypes.c_void_p]
     u.RegisterWindowMessageW.restype = wt.UINT
     u.RegisterWindowMessageW.argtypes = [ctypes.c_wchar_p]
+    u.UnhookWindowsHookEx.restype = wt.BOOL
+    u.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+    u.PostThreadMessageW.restype = wt.BOOL
+    u.PostThreadMessageW.argtypes = [wt.DWORD, wt.UINT, WPARAM, LPARAM]
+    u.GetLastInputInfo.restype = wt.BOOL
+    u.GetLastInputInfo.argtypes = [ctypes.POINTER(LASTINPUTINFO)]
     _USER32 = u
     return u
+
+
+def kernel32_api():
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.GetTickCount.restype = wt.DWORD
+    k.GetCurrentThreadId.restype = wt.DWORD
+    k.CloseHandle.argtypes = [ctypes.c_void_p]
+    return k
+
+
+def system_idle_seconds():
+    """系统层面距上一次鼠标/键盘输入的秒数（含被其他进程吃掉、钩子收不到的情况）。"""
+    try:
+        u = user32_api()
+        info = LASTINPUTINFO()
+        info.cbSize = ctypes.sizeof(LASTINPUTINFO)
+        if not u.GetLastInputInfo(ctypes.byref(info)):
+            return None
+        tick = kernel32_api().GetTickCount() & 0xFFFFFFFF
+        return ((tick - info.dwTime) & 0xFFFFFFFF) / 1000.0
+    except Exception:
+        return None
+
+
+def is_elevated():
+    try:
+        return bool(ctypes.WinDLL("shell32").IsUserAnAdmin())
+    except Exception:
+        return False
 
 
 TASKBAR_CREATED = {"id": 0}
@@ -543,6 +590,7 @@ def _worker_main(sink):
         # 钩子回调必须极快返回：只识别按键并入队，不做任何耗时操作
         if n_code == HC_ACTION:
             try:
+                HOOK_STATE["last_event"] = time.monotonic()
                 key = None
                 if w_param == WM_LBUTTONDOWN:
                     key = "left"
@@ -562,6 +610,11 @@ def _worker_main(sink):
 
     hook_proc = hookproc_type(callback)  # 保留引用，防止被回收导致钩子失效
     handle = user32.SetWindowsHookExW(WH_MOUSE_LL, hook_proc, None, 0)
+    HOOK_STATE["proc"] = hook_proc
+    HOOK_STATE["handle"] = handle
+    HOOK_STATE["installed"] = bool(handle)
+    HOOK_STATE["thread_id"] = kernel32_api().GetCurrentThreadId()
+    HOOK_STATE["last_event"] = time.monotonic()
     if handle:
         sink.put(("ready", None))
         tray_log("鼠标钩子安装成功")
@@ -577,11 +630,46 @@ def _worker_main(sink):
     msg = wt.MSG()
     while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
         try:
+            if msg.message == WM_HOOK_REINSTALL:
+                reinstall_hook(user32)
+                continue
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
         except Exception as exc:
             log("窗口消息处理异常: %r" % (exc,))
     tray_log("消息循环结束（线程即将退出）")
+
+
+def reinstall_hook(user32=None):
+    """重装低级鼠标钩子。必须在钩子线程里执行（回调会落在调用线程）。"""
+    u = user32 or user32_api()
+    try:
+        old = HOOK_STATE.get("handle")
+        if old:
+            u.UnhookWindowsHookEx(ctypes.c_void_p(old))
+        proc = HOOK_STATE.get("proc")
+        handle = u.SetWindowsHookExW(WH_MOUSE_LL, proc, None, 0) if proc else None
+        HOOK_STATE["handle"] = handle
+        HOOK_STATE["installed"] = bool(handle)
+        HOOK_STATE["last_event"] = time.monotonic()
+        tray_log("重新安装鼠标钩子：%s" % ("成功" if handle else "失败"))
+        return bool(handle)
+    except Exception as exc:
+        log("重装钩子异常: %r" % (exc,))
+        return False
+
+
+def request_hook_reinstall():
+    """从界面线程请求钩子线程重装钩子。"""
+    tid = HOOK_STATE.get("thread_id")
+    if not tid:
+        return False
+    try:
+        user32_api().PostThreadMessageW(tid, WM_HOOK_REINSTALL, 0, 0)
+        return True
+    except Exception as exc:
+        log("请求重装钩子失败: %r" % (exc,))
+        return False
 
 
 def pythonw_path():
@@ -642,16 +730,177 @@ def delete_run_values():
         log("删除开机自启动失败: %r" % (exc,))
 
 
+def _run_hidden(args):
+    """调用 schtasks 等命令行工具，不弹控制台窗口。"""
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=20,
+                              creationflags=CREATE_NO_WINDOW)
+    except Exception as exc:
+        log("执行 %s 失败: %r" % (args[:2], exc))
+        return None
+
+
+def task_exists():
+    r = _run_hidden(["schtasks", "/query", "/tn", TASK_NAME])
+    return bool(r is not None and r.returncode == 0)
+
+
+def task_command():
+    """返回计划任务里配置的可执行文件与参数（读不出来返回 (None, None)）。"""
+    r = _run_hidden(["schtasks", "/query", "/tn", TASK_NAME, "/xml", "ONE"])
+    if r is None or r.returncode != 0:
+        return None, None
+    try:
+        import xml.etree.ElementTree as ET
+
+        xml_text = r.stdout
+        root = ET.fromstring(xml_text)
+        ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+        exec_node = root.find(".//t:Actions/t:Exec", ns) or root.find(".//Actions/Exec")
+        if exec_node is None:
+            return None, None
+        command = exec_node.findtext("t:Command", None, ns) or exec_node.findtext("Command")
+        arguments = exec_node.findtext("t:Arguments", None, ns) or exec_node.findtext("Arguments")
+        return command, arguments
+    except Exception as exc:
+        log("解析计划任务失败: %r" % (exc,))
+        return None, None
+
+
+TASK_XML_TEMPLATE = """<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>黎修源</Author>
+    <Description>鼠标点击次数记录：登录时静默启动（最高权限），统计全部点击</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{user}</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{user}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{command}</Command>
+      <Arguments>--startup</Arguments>
+      <WorkingDirectory>{workdir}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"""
+
+
+def task_run_command():
+    """计划任务里要执行的命令（exe 本身；脚本模式则用 pythonw + 脚本）。"""
+    if FROZEN:
+        return sys.executable, EXE_DIR
+    return pythonw_path(), EXE_DIR
+
+
+def task_user_id():
+    domain = os.environ.get("USERDOMAIN") or os.environ.get("COMPUTERNAME") or ""
+    user = os.environ.get("USERNAME") or ""
+    return ("%s\\%s" % (domain, user)) if domain else user
+
+
+def task_xml():
+    command, workdir = task_run_command()
+    if not FROZEN:
+        # 脚本模式：Command 用 pythonw.exe，脚本路径放进 Arguments
+        script = os.path.join(EXE_DIR, "mouse_counter.py")
+        body = TASK_XML_TEMPLATE.replace("<Arguments>--startup</Arguments>",
+                                         "<Arguments>\"%s\" --startup</Arguments>" % script)
+    else:
+        body = TASK_XML_TEMPLATE
+    return body.format(user=task_user_id(), command=command, workdir=workdir)
+
+
+def create_logon_task():
+    """创建「登录时以最高权限运行」的计划任务（需要管理员权限）。
+    用计划任务的好处：开机静默启动、不弹 UAC，而且钩子处于高完整性级别，
+    带内核反作弊的游戏内点击也能统计。
+
+    注意：不要用 schtasks /tr 传带引号的命令行 —— schtasks 自己的引号解析会把
+    带引号的 exe 路径 + 参数拆错（实测报"参数错误"）。这里改用 /xml 方式，
+    参数写在 XML 的 Exec/Command + Arguments 里，最稳。"""
+    tmp = os.path.join(APP_DIR, "task_tmp.xml")
+    try:
+        with open(tmp, "w", encoding="utf-16") as f:
+            f.write(task_xml())
+    except Exception as exc:
+        log("写计划任务 XML 失败: %r" % (exc,))
+        return False
+    r = _run_hidden(["schtasks", "/create", "/tn", TASK_NAME, "/xml", tmp, "/f"])
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    ok = bool(r is not None and r.returncode == 0)
+    tray_log("创建最高权限计划任务：%s%s"
+             % ("成功" if ok else "失败",
+                "" if ok else " " + ((r.stderr or r.stdout or "").strip()[:200] if r else "")))
+    return ok
+
+
+def delete_logon_task():
+    if not task_exists():
+        return True
+    r = _run_hidden(["schtasks", "/delete", "/tn", TASK_NAME, "/f"])
+    ok = bool(r is not None and r.returncode == 0)
+    tray_log("删除计划任务：%s" % ("成功" if ok else "失败"))
+    return ok
+
+
 def startup_enabled():
-    return bool(read_run_value())
+    return bool(read_run_value()) or task_exists()
 
 
 def set_startup(enable, stats=None):
-    """开关自启动，并把用户的选择记进数据文件（跟着文件夹走）。"""
+    """开关自启动，并把用户的选择记进数据文件（跟着文件夹走）。
+
+    有管理员权限时用「计划任务 + 最高权限」——开机同样是静默启动，但不弹 UAC，
+    而且钩子以高完整性级别运行，游戏内的点击也能统计；
+    没有管理员权限时退回注册表 Run（能开机启动，但游戏内可能不计数）。
+    """
     if enable:
-        write_run_value(startup_command())
+        if is_elevated() and create_logon_task():
+            delete_run_values()  # 避免计划任务和 Run 双启动
+            AUTOSTART["mode"] = "task"
+        else:
+            write_run_value(startup_command())
+            AUTOSTART["mode"] = "run"
+            if not is_elevated():
+                tray_log("普通权限：已写入注册表 Run；建议提权后再开自启动，游戏内计数需要管理员权限")
     else:
+        delete_logon_task()
         delete_run_values()
+        AUTOSTART["mode"] = ""
     if stats is not None:
         try:
             stats.set_setting("autostart", bool(enable))
@@ -663,21 +912,49 @@ def set_startup(enable, stats=None):
 
 def sync_autostart(stats):
     """每次启动时对齐自启动状态（换电脑/挪文件夹后自动恢复）：
+      0) 计划任务存在 → 以它为准，路径变了就重建，并清掉重复的注册表项；
       1) 注册表里已有项但路径不是当前 exe → 改写成当前路径；
-      2) 注册表里没有、但数据文件记着用户开过自启动 → 重新写入；
+      2) 注册表和任务都没有、但数据文件记着用户开过 → 重新写入；
       3) 都没有 → 不动（不擅自帮用户开自启动）。"""
     target = startup_command()
     current = read_run_value()
     want = bool(stats.get_setting("autostart", False))
     try:
+        if task_exists():
+            cmd, _args = task_command()
+            if cmd and os.path.normcase(cmd) != os.path.normcase(sys.executable):
+                tray_log("计划任务路径已过期（%s），按当前位置重建" % cmd)
+                if not create_logon_task():
+                    tray_log("重建计划任务失败（可能没有管理员权限）")
+            if current:
+                delete_run_values()  # 计划任务优先，避免重复启动
+            AUTOSTART["mode"] = "task"
+            stats.set_setting("autostart", True)
+            return True
         if current:
+            # 有管理员权限时，顺手把老的「注册表 Run」升级成「最高权限计划任务」，
+            # 这样开机就能带着管理员权限静默启动（游戏内也能统计）
+            if is_elevated():
+                if create_logon_task():
+                    delete_run_values()
+                    AUTOSTART["mode"] = "task"
+                    tray_log("已把注册表自启动迁移为最高权限计划任务")
+                    stats.set_setting("autostart", True)
+                    return True
+                tray_log("迁移为计划任务失败，继续使用注册表自启动")
             if current != target:
                 write_run_value(target)
                 tray_log("自启动路径已更新为当前位置: %s" % target)
+            AUTOSTART["mode"] = "run"
             stats.set_setting("autostart", True)
         elif want:
-            write_run_value(target)
-            tray_log("未找到自启动项，按上次设置重新写入: %s" % target)
+            if is_elevated() and create_logon_task():
+                tray_log("按上次设置重建了最高权限计划任务")
+                AUTOSTART["mode"] = "task"
+            else:
+                write_run_value(target)
+                tray_log("未找到自启动项，按上次设置重新写入: %s" % target)
+                AUTOSTART["mode"] = "run"
         else:
             return False
     except Exception as exc:
@@ -702,6 +979,9 @@ class App:
         self.last_save = 0.0
         self.last_tip = 0.0
         self.last_health = 0.0
+        self.last_status = 0.0
+        self.hook_warning = False
+        self.blocked_strikes = 0
         self.hinted = False
         self._build()
         self.refresh(force=True)
@@ -773,23 +1053,24 @@ class App:
         opts = tk.Frame(root, bg=self.BG)
         opts.pack(fill="x", padx=16, pady=(10, 4))
         self.autostart = tk.BooleanVar(value=startup_enabled())
-        ttk.Checkbutton(opts, text="开机自动启动（登录后自动在后台记录）",
+        ttk.Checkbutton(opts, text="开机自动启动（登录后后台静默运行；管理员权限可统计游戏内点击）",
                         variable=self.autostart,
                         command=self.toggle_startup).pack(anchor="w")
 
         btns = tk.Frame(root, bg=self.BG)
         btns.pack(fill="x", padx=16, pady=(6, 12))
         for text, cmd in (("隐藏到后台", self.hide),
+                          ("以管理员身份重启", self.restart_as_admin),
                           ("打开数据文件夹", self.open_folder),
                           ("退出程序", self.quit_app)):
-            ttk.Button(btns, text=text, command=cmd, width=14).pack(side="left", padx=(0, 8))
+            ttk.Button(btns, text=text, command=cmd, width=13).pack(side="left", padx=(0, 6))
 
         self.status = tk.Label(root, text="", bg=self.BG, fg=self.MUTED,
                                font=("Microsoft YaHei UI", 8), anchor="w")
         self.status.pack(fill="x", padx=16, pady=(0, 10))
 
         root.update_idletasks()
-        w = 470
+        w = 520
         h = root.winfo_reqheight() + 6
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         root.geometry("%dx%d+%d+%d" % (w, h, (sw - w) // 2, (sh - h) // 3))
@@ -820,6 +1101,7 @@ class App:
             else:
                 self.stats.add(item)
                 changed = True
+                HOOK_STATE["blocked_logged"] = False  # 收到真实点击 → 钩子工作正常
         now = datetime.datetime.now().timestamp()
         if self.stats.dirty:
             if changed is False or now - self.last_save > 3:
@@ -829,6 +1111,9 @@ class App:
         if now - self.last_tip >= 5:
             self.update_tip()
             self.last_tip = now
+        if now - self.last_status >= 2:
+            self.last_status = now
+            self.update_status()
         if now - self.last_health >= 3:
             self.last_health = now
             self.health_check()
@@ -838,12 +1123,51 @@ class App:
         """看门狗：后台线程或托盘图标没了就重新拉起，避免"图标在但点了没反应"。"""
         thread = WORKER.get("thread")
         if thread is not None and thread.is_alive() and is_tray_window_alive():
+            self.check_hook_blocked()
             return
         tray_log("看门狗：后台线程存活=%s 托盘窗口存活=%s，准备重启"
                  % (thread is not None and thread.is_alive(), is_tray_window_alive()))
         TRAY["hwnd"] = None
         TRAY["ready"] = False
         start_worker(self.sink)
+
+    def check_hook_blocked(self):
+        """判断钩子是不是被"吃掉了"：系统检测到鼠标活动，但钩子长时间收不到任何事件。
+        游戏（带内核反作弊）或管理员窗口都可能出现这种情况，可用于定位"游戏内不计数"。"""
+        if not HOOK_STATE.get("installed") or not HOOK_STATE.get("last_event"):
+            return
+        idle = system_idle_seconds()
+        hook_idle = time.monotonic() - HOOK_STATE["last_event"]
+        # 连续两次（约 3~6 秒）都出现"系统在动、钩子静默"才判定，
+        # 避免 SetCursorPos 这类刷新了系统输入时间却不一定回调钩子的偶发情况误报
+        if idle is not None and idle < 2.0 and hook_idle > 30.0:
+            self.blocked_strikes += 1
+        else:
+            self.blocked_strikes = 0
+        if self.blocked_strikes < 2:
+            self.hook_warning = False
+            return
+        self.blocked_strikes = 0
+        self.hook_warning = True
+        if not HOOK_STATE.get("blocked_logged"):
+            HOOK_STATE["blocked_logged"] = True
+            tray_log("⚠ 系统检测到鼠标活动，但钩子已 %.0f 秒收不到事件："
+                     "疑似被反作弊驱动/更高权限窗口拦截（管理员权限=%s）"
+                     % (hook_idle, is_elevated()))
+        request_hook_reinstall()  # 尝试自愈（被系统摘除时有效）
+
+    def update_status(self):
+        parts = ["运行中"]
+        parts.append("管理员权限" if is_elevated() else "普通权限")
+        if AUTOSTART["mode"] == "task":
+            parts.append("自启动:计划任务(最高权限)")
+        elif AUTOSTART["mode"] == "run":
+            parts.append("自启动:注册表")
+        if self.hook_warning:
+            parts.append("⚠ 钩子疑似被拦截，游戏内可能不计数")
+        parts.append("今日 %d 次" % sum(self.stats.day_row(today()).values()))
+        self.status.configure(text=" · ".join(parts),
+                              fg=self.DANGER if self.hook_warning else self.MUTED)
 
     def refresh(self, force=False):
         if not force:
@@ -902,14 +1226,37 @@ class App:
         try:
             enabled = set_startup(self.autostart.get(), self.stats)
             self.autostart.set(enabled)
-            self.status.configure(
-                text="开机自启动已开启" if enabled else "开机自启动已关闭", fg=self.MUTED)
+            if not enabled:
+                self.status.configure(text="开机自启动已关闭", fg=self.MUTED)
+            elif is_elevated():
+                self.status.configure(text="开机自启动已开启（计划任务·最高权限·静默）", fg=self.MUTED)
+                tray_modify(info="已开启开机自启动：登录时以管理员权限静默运行，不弹 UAC。")
+            else:
+                self.status.configure(text="开机自启动已开启（普通权限·游戏内可能不计数）", fg=self.MUTED)
+                messagebox.showinfo(
+                    APP_TITLE,
+                    "已设置开机自启动，但当前是普通权限，开机后统计不到游戏内的点击。\n\n"
+                    "请先点「以管理员身份重启」并同意 UAC，再勾选本项，\n"
+                    "程序会改用「计划任务 + 最高权限」方式，开机静默运行且不弹 UAC。")
         except Exception as exc:
             self.autostart.set(startup_enabled())
             messagebox.showerror(APP_TITLE, "设置开机自启动失败：\n%r" % (exc,))
 
     def open_folder(self):
         os.startfile(EXE_DIR if os.path.isdir(EXE_DIR) else APP_DIR)
+
+    def restart_as_admin(self):
+        """游戏（带内核反作弊）常以高权限运行，普通权限的钩子收不到它们的输入，
+        这里提供一键提权重启用于验证/解决。"""
+        if is_elevated():
+            messagebox.showinfo(APP_TITLE, "当前已经是管理员权限运行，无需重启。")
+            return
+        self.stats.save(force=True)
+        if relaunch_elevated():
+            tray_remove()
+            self.root.destroy()
+        else:
+            messagebox.showinfo(APP_TITLE, "已取消授权或提权失败，程序继续以普通权限运行。")
 
     def on_close(self):
         choice = messagebox.askyesnocancel(
@@ -942,8 +1289,9 @@ def acquire_single_instance():
     kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
 
     ctypes.set_last_error(0)
-    kernel32.CreateMutexW(None, 0, MUTEX_NAME)
+    mutex = kernel32.CreateMutexW(None, 0, MUTEX_NAME)
     already = ctypes.get_last_error() == ERROR_ALREADY_EXISTS
+    SINGLETON["mutex"] = mutex
     event = kernel32.CreateEventW(None, 0, 0, SHOW_EVENT_NAME)
     if already:
         kernel32.SetEvent(event)
@@ -958,6 +1306,42 @@ def watch_show_event(kernel32, event, sink):
             sink.put(("show", None))
 
     threading.Thread(target=worker, name="show-event", daemon=True).start()
+
+
+def relaunch_elevated(extra=""):
+    """以管理员身份重启自身；成功返回 True（调用方随后退出本实例）。"""
+    tail = (" " + extra) if extra else ""
+    args = ("--elevated" + tail) if FROZEN else '"%s" --elevated%s' % (
+        os.path.join(EXE_DIR, "mouse_counter.py"), tail)
+    handle = SINGLETON.get("mutex")
+    if handle:
+        try:
+            kernel32_api().CloseHandle(ctypes.c_void_p(handle))
+        except Exception:
+            pass
+        SINGLETON["mutex"] = None
+    try:
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        shell32.ShellExecuteW.restype = ctypes.c_void_p
+        shell32.ShellExecuteW.argtypes = [
+            ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
+            ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_int]
+        ret = shell32.ShellExecuteW(None, "runas", sys.executable, args, EXE_DIR, 1)
+        if (ret or 0) > 32:
+            tray_log("已请求以管理员身份重启")
+            return True
+        log("提权被取消或失败, 返回值=%s" % (ret,))
+    except Exception as exc:
+        log("提权重启失败: %r" % (exc,))
+    # 失败/被取消 → 重新抢占单实例互斥体，继续以普通权限运行
+    try:
+        k = kernel32_api()
+        k.CreateMutexW.restype = ctypes.c_void_p
+        k.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+        SINGLETON["mutex"] = k.CreateMutexW(None, 0, MUTEX_NAME)
+    except Exception:
+        pass
+    return False
 
 
 def dump():
@@ -985,6 +1369,9 @@ def main():
         dump()
         return
     if "--set-startup" in args:
+        if not is_elevated() and "--elevated" not in args:
+            if relaunch_elevated("--set-startup"):
+                return  # 提权成功：由管理员实例去创建计划任务
         print("开机自启动：%s" % ("已开启" if set_startup(True, Stats(DATA_FILE)) else "设置失败"))
         return
     if "--clear-startup" in args:
@@ -997,6 +1384,13 @@ def main():
     kernel32, event = handle
 
     silent = "--startup" in args  # 由开机自启动拉起：只驻留托盘，不弹窗口
+
+    # 手动启动时自动申请管理员权限：游戏（内核反作弊）以高权限运行，
+    # 普通权限的低级钩子收不到它们的输入。带 --elevated 的一次性进程不再递归提权。
+    if not silent and "--elevated" not in args and not is_elevated():
+        if relaunch_elevated():
+            return
+
     tray_log("程序启动 pid=%s frozen=%s silent=%s cwd=%s"
              % (os.getpid(), FROZEN, silent, os.getcwd()))
     sink = queue.Queue()
