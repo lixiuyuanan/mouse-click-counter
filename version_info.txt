@@ -1,0 +1,28 @@
+# UTF-8
+# PyInstaller 版本资源文件：--version-file version_info.txt
+# 发版时同步修改 VSVersionInfo / StringStruct 里的 4 处版本号 + 源码 APP_VERSION
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(2, 2, 0, 0),
+    prodvers=(2, 2, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringStruct('CompanyName', '黎修源'),
+      StringStruct('FileDescription', '鼠标点击次数记录'),
+      StringStruct('FileVersion', '2.2.0'),
+      StringStruct('InternalName', '鼠标点击次数记录'),
+      StringStruct('LegalCopyright', 'Copyright © 2026 黎修源'),
+      StringStruct('OriginalFilename', '鼠标点击次数记录.exe'),
+      StringStruct('ProductName', '鼠标点击次数记录'),
+      StringStruct('ProductVersion', '2.2.0')
+    ]),
+    VarFileInfo([VarStruct('Translation', [2052, 1200])])
+  ]
+)
