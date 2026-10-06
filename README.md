@@ -6,6 +6,7 @@ Windows 下的鼠标按键点击次数统计小工具：底层鼠标钩子计数
 
 上一个鼠标用了一年半因为左键双击报废了，为了记录新鼠标的使用次数和频率，用deepseek-v4.1-flash花了4.2元完成该软件，功能单一仅供娱乐。
 
+下载地址https://github.com/lixiuyuanan/mouse-click-counter/releases 选择V2.x.0.rar下载
 ## 能做什么
 
 - 统计 **左键 / 右键 / 中键 / 侧键1 / 侧键2** 五类按键的点击次数
