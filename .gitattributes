@@ -1,0 +1,3 @@
+# keep line endings as-is (Chinese docs + CRLF sources)
+* -text
+*.pytext
